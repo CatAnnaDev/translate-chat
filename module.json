@@ -1,0 +1,14 @@
+{
+    "disableAutoUpdate": false,
+    "name": "translate-chat",
+    "author": "CatAnnaDev",
+    "version": "2.0",
+    "description": "Translates incoming and outgoing messages using DeepL (free, no key) with Google fallback, an editable game glossary, and a detected-language tag.",
+    "options": {
+        "niceName": "translate-chat",
+        "settingsVersion": 3,
+        "settingsFile": "config.json",
+        "settingsMigrator": "src/setting_migration.js"
+    },
+    "servers": ["https://raw.githubusercontent.com/CatAnnaDev/translate-chat/main/"]
+}

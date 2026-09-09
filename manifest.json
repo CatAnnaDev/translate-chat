@@ -1,0 +1,20 @@
+{
+    "files": {
+        "README.md": "3a1938667b83fc0dedc7798eb07c2d703c7ee81a2679747a6280fd928281f303",
+        "lib/language-detector/LICENSE": "84912a26f83f364da008f21740f703434e380ed1658a9a00c9f3b8e5b045df36",
+        "lib/language-detector/data/lang.json": "a26067df3f9f3f4498132c37cd8fdb5b2621be07b2db9483edc7fde51ca02031",
+        "lib/language-detector/data/unicode_blocks.json": "60945d5e293568e0591625a286be98b246893d08dc133c4bba02eeaa4f716ed4",
+        "lib/language-detector/index.js": "b0e52b0ed41f5c8e1ad601be66c160d741e7f2b99e50c5e3c5edff51b4f3623c",
+        "lib/language-detector/lib/ISO639.js": "07ae63de281a38ed0f0d05eab368d6a0d59f981b3972814028dfd648665dcb07",
+        "lib/language-detector/lib/LanguageDetect.js": "8dbc5e218a1990a908d435963d6500b78849b4cd3977c1f837615efdb36ad6bb",
+        "lib/language-detector/lib/Parser.js": "492f50f49566effeaa0d37d1078915aba4477d4018c09bda228f7f68b07bec13",
+        "lib/language-detector/package.json": "025d2442278dfd6f96c728bfa7824952764320af69b63c7e2ae1d7e7d07d38d6",
+        "module.json": "eb3f2fddb28f35c8bc17877cc0aa9ff9597fc2df892c43dc01453fcf037da9d0",
+        "package.json": "f0f269049d5f10a5334c51af396bf1f245072fb50ff0f00b2757e3398b3f841e",
+        "src/glossary.js": "9e22c07d719d996a5fa3dea1a74d6d57cd9d09c1770f54936f4f64f09b089970",
+        "src/index.js": "540703929e94fae79e7a5bb7e0e3ff1eb2d77768786b2e48fe047c37ab8bfbec",
+        "src/normalize.js": "54eb83ca3e15898f72091ba6bac1c8067972a2c03145ff72647de362175d9efa",
+        "src/setting_migration.js": "f626b2ceecec912dccf81cdcbdc9d301160c9131b0c7ad27173dcb0c1e6cacd5",
+        "src/translate.js": "d613ba483afdc951cd5965840e7878b10a1110b137d39838cde1ddec305ad774"
+    }
+}
