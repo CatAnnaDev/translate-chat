@@ -1,0 +1,37 @@
+{
+    "version": 4,
+    "data": {
+        "enabled": true,
+        "sourceLang": "auto",
+        "targetLang": "en",
+        "sendMode": false,
+        "sendLang": "en",
+        "deeplKey": "",
+        "useGlossary": true,
+        "showTag": true,
+        "googleKey": "",
+        "providers": [
+            "deepl",
+            "google"
+        ],
+        "displayMode": "inline",
+        "separator": " | ",
+        "color": "#9be37c",
+        "translateOwn": false,
+        "echoOriginal": true,
+        "ignoreChannels": [],
+        "minLetters": 2,
+        "maxLength": 500,
+        "localDetect": true,
+        "localDetectMinLength": 10,
+        "asciiOnly": "auto",
+        "holdTimeoutMs": 3000,
+        "requestTimeoutMs": 2000,
+        "maxConcurrent": 4,
+        "maxQueue": 100,
+        "cacheSize": 2000,
+        "notify": true,
+        "logLevel": "info",
+        "logFile": true
+    }
+}

@@ -1,175 +1,241 @@
+'use strict';
+
 const path = require('path');
-const { translate, normalizeNa, AVAILABLE_LANGUAGES } = require('./translate');
-const { loadTerms, buildMatcher, glossaryPath } = require('./glossary');
+const { DEFAULTS } = require('./defaults');
+const config = require('./config');
+const L = require('./lang');
+const msg = require('./message');
+const { normalize } = require('./normalize');
+const { Logger } = require('./logger');
+const { Glossary } = require('./glossary');
+const { Translator } = require('./translate');
+const { Notifier } = require('./notifier');
+const { OrderedRelease } = require('./ordered');
+const registerCommands = require('./commands');
 
-const CACHE_MAX = 2000;
+const INCOMING = ['S_CHAT', 'S_WHISPER', 'S_PRIVATE_CHAT'];
+const OUTGOING = ['C_CHAT', 'C_WHISPER'];
+const VERSION = '3.0';
 
-module.exports = class Translator {
+module.exports = class TranslateChat {
   constructor(mod) {
     this.mod = mod;
     this.rootDir = path.join(__dirname, '..');
-    this.cache = new Map();
-    this.reloadGlossary();
-    this.addCommand();
+    this.version = VERSION;
+    this.saveTimer = null;
+
+    const self = this;
+    this.cfg = new Proxy({}, {
+      get(_, key) {
+        const v = mod.settings[key];
+        return v === undefined ? DEFAULTS[key] : v;
+      },
+      set(_, key, value) {
+        mod.settings[key] = value;
+        self.scheduleSave();
+        return true;
+      },
+    });
+
+    this.log = new Logger({
+      mod,
+      getLevel: () => this.cfg.logLevel,
+      fileEnabled: () => this.cfg.logFile,
+      dir: this.rootDir,
+      secrets: () => [this.cfg.deeplKey, this.cfg.googleKey],
+    });
+
+    const repaired = config.sanitize(mod.settings);
+    if (repaired.length) {
+      this.log.warn(`invalid settings reset to defaults: ${repaired.join(', ')}`);
+      this.scheduleSave();
+    }
+
+    this.glossary = new Glossary(this.rootDir, this.log);
+    this.notifier = new Notifier({ mod, cfg: this.cfg, log: this.log });
+    this.translator = new Translator({ cfg: this.cfg, log: this.log, notifier: this.notifier });
+
+    const onError = e => this.log.error('error while delivering a message', e);
+    const timers = { setTimer: (fn, ms) => mod.setTimeout(fn, ms), clearTimer: t => mod.clearTimeout(t), onError };
+    this.inbound = new OrderedRelease(timers);
+    this.outbound = new OrderedRelease(timers);
+
+    registerCommands(this);
     this.setupHooks();
 
-    this.mod.game.on('leave_loading_screen', () => {
-      if (mod.settings.sendMode) {
-        this.mod.command.message(`Send Mode Enabled. Translating outgoing messages to ${this.mod.settings.sendLang}.`);
-        this.mod.command.message('Use "/8 translate send off" to disable it.');
+    mod.game.on('leave_loading_screen', () => {
+      this.notifier.flushBacklog();
+      if (this.cfg.sendMode) {
+        this.say(`Send mode enabled. Translating outgoing messages to ${this.cfg.sendLang}.`);
+        this.say('Use "/8 translate send off" to disable it.');
       }
     });
+
+    this.log.info(`v${VERSION} ready: ${this.cfg.enabled ? 'enabled' : 'disabled'}, target=${this.cfg.targetLang}, providers=${this.cfg.providers.join('>')}, glossary=${this.glossary.size} terms`);
+    if (!this.cfg.deeplKey) this.log.info('no DeepL key set: Google is used (get a free key at deepl.com, then "translate key <key>")');
+
+    this.destructor = () => {
+      this.inbound.clear();
+      this.outbound.clear();
+      this.log.destroy();
+    };
   }
 
-  reloadGlossary() {
-    this.glossaryMatcher = buildMatcher(loadTerms(this.rootDir));
+  say(text) {
+    try { this.mod.command.message(text); } catch (e) { this.log.debug('command.message failed', e); }
   }
 
-  cacheGet(key) {
-    return this.cache.get(key);
+  scheduleSave() {
+    if (this.saveTimer) return;
+    this.saveTimer = this.mod.setTimeout(() => {
+      this.saveTimer = null;
+      try { this.mod.saveSettings(); } catch (e) { this.log.error('could not save settings', e); }
+    }, 300);
   }
 
-  cacheSet(key, value) {
-    if (this.cache.size >= CACHE_MAX) this.cache.delete(this.cache.keys().next().value);
-    this.cache.set(key, value);
+  send(packet, version, event) {
+    try { this.mod.send(packet, version, event); } catch (e) { this.log.error(`failed to send ${packet}`, e); }
+  }
+
+  asciiOnly() {
+    const v = this.cfg.asciiOnly;
+    return v === 'on' || (v === 'auto' && this.mod.publisher === 'eme');
+  }
+
+  transform() {
+    return this.asciiOnly() ? s => normalize(s).replace(/[^\x00-\x7F]/g, '') : null;
+  }
+
+  isOwn(event) {
+    try {
+      if (event.gameId !== undefined && this.mod.game.me.is(event.gameId)) return true;
+    } catch (e) { /* not logged in yet */ }
+    const name = event.name || event.author || event.authorName || event.player;
+    const me = this.mod.game.me;
+    return !!(name && me && me.name && name === me.name);
+  }
+
+  passthrough(seq, packet, version, event) {
+    if (seq.pending === 0) return undefined;
+    seq.add(null, 0, () => this.send(packet, version, event));
+    return false;
   }
 
   setupHooks() {
-    const incomingMsgHandler = async (packet, version, event) => {
-      if (!this.mod.settings.enabled) return;
-      if (this.mod.game.me.is(event.gameId)) return;
-
-      const result = await this.translate(event.message, { target: this.mod.settings.targetLang, source: this.mod.settings.sourceLang });
-      if (!result || !result.text) return;
-
-      const tag = this.mod.settings.showTag && result.src ? `[${result.src.toUpperCase()}] ` : '';
-      this.mod.send(packet, version, { ...event, message: `<FONT>(Translated) ${tag}${result.text}</FONT>` });
-    };
-
-    const outgoingMessageHandler = (packet, version, event) => {
-      if (!this.mod.settings.enabled) return;
-      if (!this.mod.settings.sendMode) return;
-
-      (async () => {
-        const result = await this.translate(event.message, { source: 'auto', target: this.mod.settings.sendLang });
-        if (!result || !result.text) return this.mod.send(packet, version, event);
-
-        this.mod.send(packet, version, { ...event, message: `<FONT>${result.text}</FONT>` });
-        this.mod.command.message(`Original message: ${event.message.replace(/<(.+?)>|&rt;|&lt;|&gt;|/g, '').replace(/\s+$/, '')}`);
-      })();
-
-      return false;
-    };
-
-    const CHAT_SERVER_PACKETS = [['S_CHAT', '*'], ['S_WHISPER', '*'], ['S_PRIVATE_CHAT', '*']];
-    for (const [packet, version] of CHAT_SERVER_PACKETS) this.mod.hook(packet, version, { order: 100 }, event => incomingMsgHandler(packet, version, event));
-    const CHAT_CLIENT_PACKETS = [['C_WHISPER', '*'], ['C_CHAT', '*']];
-    for (const [packet, version] of CHAT_CLIENT_PACKETS) this.mod.hook(packet, version, {}, event => outgoingMessageHandler(packet, version, event));
+    const opts = { order: 100, filter: { fake: false } };
+    for (const packet of INCOMING) this.hookPacket(packet, opts, (event, version) => this.onIncoming(packet, version, event));
+    for (const packet of OUTGOING) this.hookPacket(packet, opts, (event, version) => this.onOutgoing(packet, version, event));
   }
 
-  async translate(message, { target, source }) {
-    const sanitized = message.replace(/<(.+?)>|&rt;|&lt;|&gt;|/g, '').replace(/\s+$/, '');
-    if (sanitized === '') return;
+  hookPacket(packet, opts, handler) {
+    const version = '*';
+    try {
+      this.mod.hook(packet, version, opts, event => {
+        try {
+          return handler(event, version);
+        } catch (e) {
+          this.log.error(`${packet} handler failed, message passed through unchanged`, e);
+          return undefined;
+        }
+      });
+    } catch (e) {
+      this.log.error(`cannot hook ${packet} (not supported by this protocol map)`, e);
+    }
+  }
 
-    const cacheKey = `${target}|${sanitized}`;
-    const cached = this.cacheGet(cacheKey);
-    if (cached) return cached;
+  onIncoming(packet, version, event) {
+    const cfg = this.cfg;
+    if (!cfg.enabled || typeof event.message !== 'string' || !event.message) return undefined;
 
-    const result = await translate(sanitized, target, source, {
-      deeplKey: this.mod.settings.deeplKey,
-      matcher: this.glossaryMatcher,
-      useGlossary: this.mod.settings.useGlossary,
-    }).catch(e => {
-      this.mod.error(`Translation error, message:${message}, target:${target}, source:${source}, error:`, e);
+    const separate = cfg.displayMode === 'separate';
+    const seq = this.inbound;
+    const pass = () => (separate ? undefined : this.passthrough(seq, packet, version, event));
+
+    if (!cfg.translateOwn && this.isOwn(event)) return pass();
+    if (event.channel !== undefined && cfg.ignoreChannels.includes(event.channel)) return pass();
+
+    const source = cfg.sourceLang;
+    const target = cfg.targetLang;
+    if (source !== 'auto' && L.baseLang(source) === L.baseLang(target)) return pass();
+
+    const parsed = msg.parse(event.message, cfg.useGlossary ? this.glossary : null);
+    if (parsed.letters < cfg.minLetters || parsed.text.length > cfg.maxLength) return pass();
+
+    const tr = this.translator;
+    const cached = tr.peek(parsed.text, source, target);
+    if (cached === undefined && tr.localSame(parsed.plain, target)) return pass();
+
+    const transform = this.transform();
+
+    if (separate) {
+      const show = e => {
+        if (e && !e.same) this.send(packet, version, Object.assign({}, event, { message: msg.renderSeparate(parsed, e, cfg, transform) }));
+      };
+      if (cached !== undefined) show(cached);
+      else tr.translate(parsed.text, source, target, { deadline: Date.now() + cfg.holdTimeoutMs }).then(show).catch(e => this.log.error('separate display failed', e));
       return undefined;
+    }
+
+    const render = e => (e && !e.same ? msg.renderInbound(event.message, parsed, e, cfg, transform) : null);
+    const deliver = e => {
+      const m = render(e);
+      this.send(packet, version, m === null ? event : Object.assign({}, event, { message: m }));
+    };
+
+    if (cached !== undefined) {
+      if (seq.pending === 0) {
+        const m = render(cached);
+        if (m === null) return undefined;
+        event.message = m;
+        return true;
+      }
+      seq.add(cached, 0, deliver);
+      return false;
+    }
+
+    const promise = tr.translate(parsed.text, source, target, { deadline: Date.now() + cfg.holdTimeoutMs });
+    seq.add(promise, cfg.holdTimeoutMs, (e, timedOut) => {
+      if (timedOut) this.log.debug(`translation timed out after ${cfg.holdTimeoutMs}ms, original message delivered`);
+      deliver(e);
     });
-
-    if (!result || !result.text) return;
-    const text = this.mod.publisher === 'eme' ? normalizeNa(result.text) : result.text;
-    if (text === sanitized) return;
-
-    const out = { text, src: result.src };
-    if (source !== 'auto' || target === this.mod.settings.targetLang) this.cacheSet(cacheKey, out);
-    return out;
+    return false;
   }
 
-  addCommand() {
-    this.mod.command.add('translate', {
-      $default: () => {
-        this.mod.settings.enabled = !this.mod.settings.enabled;
-        this.mod.command.message(`Module ${this.mod.settings.enabled ? 'enabled' : 'disabled'}`);
-        this.mod.saveSettings();
-      },
-      key: apiKey => {
-        if (!apiKey) {
-          this.mod.command.message(this.mod.settings.deeplKey ? 'A DeepL key is set. Use "translate key none" to remove it.' : 'No DeepL key set. Use "translate key <your-key>" to add one (falls back to Google otherwise).');
-          return;
-        }
-        this.mod.settings.deeplKey = apiKey === 'none' ? '' : apiKey;
-        this.mod.command.message(this.mod.settings.deeplKey ? 'DeepL key saved. DeepL is now the primary translator.' : 'DeepL key removed. Using Google.');
-        this.mod.saveSettings();
-      },
-      tag: () => {
-        this.mod.settings.showTag = !this.mod.settings.showTag;
-        this.mod.command.message(`Detected-language tag ${this.mod.settings.showTag ? 'shown' : 'hidden'}.`);
-        this.mod.saveSettings();
-      },
-      glossary: () => {
-        this.reloadGlossary();
-        this.cache.clear();
-        this.mod.command.message(`Glossary reloaded from ${glossaryPath(this.rootDir)}`);
-      },
-      source: language => {
-        if (!language) {
-          this.mod.command.message(`Source Language: ${this.mod.settings.sourceLang}.`);
-          return;
-        }
-        if (!AVAILABLE_LANGUAGES.includes(language)) {
-          this.mod.command.message(`Error: ${language} is not a valid language. See readme for available languages. Recommended: auto`);
-          return;
-        }
-        this.mod.command.message(`Source Language set to: ${language}.`);
-        this.mod.settings.sourceLang = language;
-        this.cache.clear();
-        this.mod.saveSettings();
-      },
-      target: language => {
-        if (!language) {
-          this.mod.command.message(`Target Language: ${this.mod.settings.targetLang}.`);
-          return;
-        }
-        if (!AVAILABLE_LANGUAGES.includes(language)) {
-          this.mod.command.message(`Error: ${language} is not a valid language. See readme for available languages.`);
-          return;
-        }
-        if (language === 'auto') {
-          this.mod.command.message('Error: Target Language cannot be auto.');
-          return;
-        }
-        this.mod.command.message(`Target Language set to: ${language}.`);
-        this.mod.settings.targetLang = language;
-        this.cache.clear();
-        this.mod.saveSettings();
-      },
-      send: language => {
-        if (language === undefined) {
-          this.mod.settings.sendMode = !this.mod.settings.sendMode;
-          this.mod.command.message(`Send Mode: ${this.mod.settings.sendMode ? ('enabled. Language: ' + this.mod.settings.sendLang) : 'disabled.'}`);
-        } else if (AVAILABLE_LANGUAGES.includes(language)) {
-          this.mod.settings.sendMode = true;
-          this.mod.settings.sendLang = language;
-          this.mod.command.message(`Now translating outgoing messages to: ${language}`);
-        } else if (language === 'off') {
-          this.mod.settings.sendMode = false;
-          this.mod.command.message('Send Mode Disabled.');
-        } else if (language === 'on') {
-          this.mod.settings.sendMode = true;
-          this.mod.command.message(`Send Mode Enabled. Now translating outgoing messages to ${this.mod.settings.sendLang}.`);
-        } else {
-          this.mod.command.message(`Error: ${language} is not a valid language. See readme for available languages.`);
-        }
-        this.mod.saveSettings();
-      },
+  onOutgoing(packet, version, event) {
+    const cfg = this.cfg;
+    if (!cfg.enabled || !cfg.sendMode || typeof event.message !== 'string' || !event.message) return undefined;
+
+    const seq = this.outbound;
+    const pass = () => this.passthrough(seq, packet, version, event);
+    const target = cfg.sendLang;
+
+    const parsed = msg.parse(event.message, cfg.useGlossary ? this.glossary : null);
+    if (parsed.letters < cfg.minLetters || parsed.text.length > cfg.maxLength) return pass();
+
+    const tr = this.translator;
+    const cached = tr.peek(parsed.text, 'auto', target);
+    if (cached === undefined && tr.localSame(parsed.plain, target)) return pass();
+
+    const deliver = e => {
+      if (e && !e.same) {
+        this.send(packet, version, Object.assign({}, event, { message: msg.renderOutbound(parsed, e) }));
+        if (cfg.echoOriginal) this.say(`Original message: ${parsed.plain}`);
+      } else {
+        this.send(packet, version, event);
+      }
+    };
+
+    if (cached !== undefined) {
+      if (seq.pending === 0 && (!cached || cached.same)) return undefined;
+      seq.add(cached, 0, deliver);
+      return false;
+    }
+
+    const promise = tr.translate(parsed.text, 'auto', target, { deadline: Date.now() + cfg.holdTimeoutMs });
+    seq.add(promise, cfg.holdTimeoutMs, (e, timedOut) => {
+      if (timedOut) this.log.warn(`outgoing translation timed out after ${cfg.holdTimeoutMs}ms, message sent untranslated`);
+      deliver(e);
     });
+    return false;
   }
 };

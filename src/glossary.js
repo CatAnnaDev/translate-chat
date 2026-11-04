@@ -1,3 +1,5 @@
+'use strict';
+
 const fs = require('fs');
 const path = require('path');
 
@@ -6,28 +8,17 @@ const DEFAULT_TERMS = [
   'wtb', 'wts', 'wtt', 'lfg', 'lfm', 'lfp', 'pst', 'ping', 'dc', 'fps',
   'tank', 'heal', 'healer', 'dps', 'buff', 'debuff', 'aggro', 'proc', 'cc',
   'aoe', 'dot', 'hot', 'mob', 'boss', 'nerf', 'meta', 'pug', 'alt', 'main',
-  'crit', 'cd', 'oom', 'rez', 'res', 'aggro', 'kite', 'pull', 'add', 'adds',
+  'crit', 'cd', 'oom', 'rez', 'res', 'kite', 'pull', 'add', 'adds',
   'nostrum', 'crystal', 'enchant', 'masterwork', 'enigmatic', 'vanguard',
   'priest', 'mystic', 'lancer', 'berserker', 'slayer', 'warrior', 'archer',
   'sorcerer', 'gunner', 'brawler', 'ninja', 'valkyrie', 'reaper',
-  'elin', 'popori', 'castanic', 'aman', 'baraka'
+  'elin', 'popori', 'castanic', 'aman', 'baraka',
 ];
+
+const MAX_TERMS = 5000;
 
 function glossaryPath(dir) {
   return path.join(dir, 'glossary.json');
-}
-
-function loadTerms(dir) {
-  const p = glossaryPath(dir);
-  try {
-    if (fs.existsSync(p)) {
-      const arr = JSON.parse(fs.readFileSync(p, 'utf8'));
-      if (Array.isArray(arr)) return arr.filter(t => typeof t === 'string' && t.trim().length);
-    } else {
-      fs.writeFileSync(p, JSON.stringify(DEFAULT_TERMS, null, 2));
-    }
-  } catch (e) {}
-  return DEFAULT_TERMS.slice();
 }
 
 function buildMatcher(terms) {
@@ -39,32 +30,51 @@ function buildMatcher(terms) {
   return new RegExp(`(?<![\\p{L}\\p{N}])(?:${escaped.join('|')})(?![\\p{L}\\p{N}])`, 'giu');
 }
 
-function protectHtml(text, matcher) {
-  if (!matcher) return text;
-  return text.replace(matcher, m => `<g>${m}</g>`);
-}
-
-function stripHtml(text) {
-  return text.replace(/<\/?g>/g, '');
-}
-
-function protectTokens(text, matcher) {
-  if (!matcher) return { text, kept: [] };
-  const kept = [];
-  const out = text.replace(matcher, m => {
-    const token = `x${kept.length}zq`;
-    kept.push(m);
-    return token;
-  });
-  return { text: out, kept };
-}
-
-function restoreTokens(text, kept) {
-  let out = text;
-  for (let i = 0; i < kept.length; i++) {
-    out = out.replace(new RegExp(`x${i}zq`, 'gi'), kept[i]);
+class Glossary {
+  constructor(dir, log) {
+    this.dir = dir;
+    this.log = log;
+    this.terms = [];
+    this.matcher = null;
+    this.reload();
   }
-  return out;
+
+  get file() { return glossaryPath(this.dir); }
+  get size() { return this.terms.length; }
+
+  reload() {
+    let terms = DEFAULT_TERMS.slice();
+    const p = this.file;
+    try {
+      if (fs.existsSync(p)) {
+        const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+        const arr = Array.isArray(data) ? data : data && Array.isArray(data.terms) ? data.terms : null;
+        if (arr) terms = arr.filter(t => typeof t === 'string' && t.trim().length);
+        else this.log.warn(`glossary.json must be a JSON array of strings; using built-in defaults (file left untouched)`);
+      } else {
+        fs.writeFileSync(p, JSON.stringify(DEFAULT_TERMS, null, 2));
+        this.log.info(`created ${p}`);
+      }
+    } catch (e) {
+      this.log.warn('could not read glossary.json, using built-in defaults (file left untouched)', e);
+    }
+    const seen = new Set();
+    this.terms = [];
+    for (const t of terms) {
+      const k = t.trim();
+      const lk = k.toLowerCase();
+      if (!k || seen.has(lk)) continue;
+      seen.add(lk);
+      this.terms.push(k);
+      if (this.terms.length >= MAX_TERMS) { this.log.warn(`glossary truncated to ${MAX_TERMS} terms`); break; }
+    }
+    this.matcher = buildMatcher(this.terms);
+    return this.terms.length;
+  }
+
+  protect(text, addSpan) {
+    return this.matcher ? text.replace(this.matcher, m => addSpan(m)) : text;
+  }
 }
 
-module.exports = { DEFAULT_TERMS, glossaryPath, loadTerms, buildMatcher, protectHtml, stripHtml, protectTokens, restoreTokens };
+module.exports = { DEFAULT_TERMS, glossaryPath, buildMatcher, Glossary };

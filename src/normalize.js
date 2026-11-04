@@ -1,4 +1,3 @@
-// table stolen from stackoverflow
 const REPLACEMENT_TABLE = {
   Á: 'A',
   Ă: 'A',

@@ -1,198 +1,228 @@
-const request = require('node-fetch');
-const { normalize } = require('./normalize');
-const { protectHtml, stripHtml, protectTokens, restoreTokens } = require('./glossary');
-const LanguageDetect = require('../lib/language-detector');
-const lngDetector = new LanguageDetect();
-lngDetector.setLanguageType('iso2');
+'use strict';
 
-module.exports.AVAILABLE_LANGUAGES = ['af', 'sq', 'ar', 'az', 'eu', 'bn', 'be', 'bg', 'ca', 'zh-CN', 'zh-TW', 'hr', 'cs', 'da', 'nl', 'en', 'eo', 'et', 'tl', 'fi', 'fr', 'gl', 'ka', 'de', 'el', 'gu', 'ht', 'iw', 'hi', 'hu', 'is', 'id', 'ga', 'it', 'ja', 'kn', 'ko', 'la', 'lv', 'lt', 'mk', 'ms', 'mt', 'no', 'fa', 'pl', 'pt', 'ro', 'ru', 'sr', 'sk', 'sl', 'es', 'sw', 'sv', 'ta', 'te', 'th', 'tr', 'uk', 'ur', 'vi', 'cy', 'yi', 'any'];
+const L = require('./lang');
+const { TranslateError, DeepL, Google, wrapNetworkError } = require('./providers');
 
-const DEEPL_TARGETS = new Set(['AR', 'BG', 'CS', 'DA', 'DE', 'EL', 'EN-GB', 'EN-US', 'ES', 'ET', 'FI', 'FR', 'HU', 'ID', 'IT', 'JA', 'KO', 'LT', 'LV', 'NB', 'NL', 'PL', 'PT-BR', 'PT-PT', 'RO', 'RU', 'SK', 'SL', 'SV', 'TR', 'UK', 'ZH']);
-const DEEPL_TARGET_MAP = { en: 'EN-US', 'en-us': 'EN-US', 'en-gb': 'EN-GB', pt: 'PT-BR', 'pt-br': 'PT-BR', 'pt-pt': 'PT-PT', 'zh-cn': 'ZH', 'zh-tw': 'ZH', no: 'NB', nb: 'NB' };
-const DEEPL_SOURCE_MAP = { en: 'EN', pt: 'PT', 'pt-br': 'PT', 'pt-pt': 'PT', 'zh-cn': 'ZH', 'zh-tw': 'ZH', no: 'NB', nb: 'NB' };
+let LanguageDetect = null;
+try { LanguageDetect = require('../lib/language-detector'); } catch (e) { /* optional: the engine works without it */ }
 
-function toDeeplTarget(code) {
-  const c = DEEPL_TARGET_MAP[code.toLowerCase()] || code.toUpperCase();
-  return DEEPL_TARGETS.has(c) ? c : null;
+class LRU {
+  constructor(max) { this.max = max; this.map = new Map(); }
+  get size() { return this.map.size; }
+  get(key) {
+    const v = this.map.get(key);
+    if (v !== undefined) { this.map.delete(key); this.map.set(key, v); }
+    return v;
+  }
+  set(key, value) {
+    if (this.max <= 0) return;
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, value);
+    while (this.map.size > this.max) this.map.delete(this.map.keys().next().value);
+  }
+  clear() { this.map.clear(); }
 }
 
-function toDeeplSource(code) {
-  if (!code || code === 'auto') return null;
-  const c = DEEPL_SOURCE_MAP[code.toLowerCase()] || code.toUpperCase();
-  return c.replace(/-.*/, '');
+class Limiter {
+  constructor(getMax) { this.getMax = getMax; this.active = 0; this.queue = []; }
+  get queued() { return this.queue.length; }
+  run(fn) {
+    return new Promise(resolve => {
+      this.queue.push({ fn, resolve });
+      this.pump();
+    });
+  }
+  pump() {
+    while (this.active < this.getMax() && this.queue.length) {
+      const job = this.queue.shift();
+      this.active++;
+      Promise.resolve().then(job.fn).then(job.resolve, () => job.resolve(null)).then(() => { this.active--; this.pump(); });
+    }
+  }
 }
 
-async function deepl(text, target, source, { deeplKey, matcher, useGlossary }) {
-  const deeplTarget = toDeeplTarget(target);
-  if (!deeplKey || !deeplTarget) return null;
+const sameText = (a, b) => a.replace(/\s+/g, ' ').trim().toLowerCase() === b.replace(/\s+/g, ' ').trim().toLowerCase();
 
-  const endpoint = deeplKey.trim().endsWith(':fx')
-    ? 'https://api-free.deepl.com/v2/translate'
-    : 'https://api.deepl.com/v2/translate';
-
-  let payload = text;
-  const protectedText = useGlossary && matcher ? protectHtml(text, matcher) : text;
-  const usedTags = protectedText !== text;
-  payload = protectedText;
-
-  const params = new URLSearchParams();
-  params.append('text', payload);
-  params.append('target_lang', deeplTarget);
-  const deeplSource = toDeeplSource(source);
-  if (deeplSource) params.append('source_lang', deeplSource);
-  if (usedTags) {
-    params.append('tag_handling', 'xml');
-    params.append('ignore_tags', 'g');
+class Translator {
+  constructor({ cfg, log, notifier }) {
+    this.cfg = cfg;
+    this.log = log;
+    this.notifier = notifier;
+    this.providers = { deepl: new DeepL(), google: new Google() };
+    this.cache = new LRU(cfg.cacheSize);
+    this.limiter = new Limiter(() => cfg.maxConcurrent);
+    this.inflight = new Map();
+    this.detector = null;
+    this.stats = this.freshStats();
+    if (LanguageDetect) {
+      try { this.detector = new LanguageDetect(); this.detector.setLanguageType('iso2'); } catch (e) { this.log.warn('local language detector unavailable', e); }
+    }
   }
 
-  const response = await request(endpoint, {
-    method: 'post',
-    body: params,
-    headers: {
-      'Authorization': `DeepL-Auth-Key ${deeplKey.trim()}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-  });
-  if (!response.ok) return null;
-
-  const json = await response.json();
-  const first = json.translations && json.translations[0];
-  if (!first) return null;
-  return {
-    text: usedTags ? stripHtml(first.text) : first.text,
-    src: (first.detected_source_language || '').toLowerCase(),
-  };
-}
-
-const DEEPL_FREE_TARGETS = new Set(['AR', 'BG', 'CS', 'DA', 'DE', 'EL', 'EN', 'ES', 'ET', 'FI', 'FR', 'HU', 'ID', 'IT', 'JA', 'KO', 'LT', 'LV', 'NB', 'NL', 'PL', 'PT', 'RO', 'RU', 'SK', 'SL', 'SV', 'TR', 'UK', 'ZH']);
-const DEEPL_FREE_MAP = { en: 'EN', 'en-us': 'EN', 'en-gb': 'EN', pt: 'PT', 'pt-br': 'PT', 'pt-pt': 'PT', 'zh-cn': 'ZH', 'zh-tw': 'ZH', no: 'NB', nb: 'NB' };
-
-function toFreeLang(code) {
-  const c = DEEPL_FREE_MAP[code.toLowerCase()] || code.toUpperCase().replace(/-.*/, '');
-  return DEEPL_FREE_TARGETS.has(c) ? c : null;
-}
-
-function countI(text) {
-  return (text.match(/i/gi) || []).length;
-}
-
-function freeTimestamp(iCount) {
-  const t = Date.now();
-  const n = iCount + 1;
-  return t - (t % n) + n;
-}
-
-async function deeplFree(text, target, source, { matcher, useGlossary }) {
-  const targetLang = toFreeLang(target);
-  if (!targetLang) return null;
-  const sourceLang = source && source !== 'auto' ? (toFreeLang(source) || 'auto') : 'auto';
-
-  let payload = text;
-  let kept = [];
-  if (useGlossary && matcher) {
-    const r = protectTokens(text, matcher);
-    payload = r.text;
-    kept = r.kept;
+  freshStats() {
+    return { requests: 0, cacheHits: 0, cacheMisses: 0, joined: 0, translated: 0, sameLanguage: 0, localSkips: 0, failed: 0, dropped: 0 };
   }
 
-  const iCount = countI(payload) + 1;
-  const id = Math.floor(Math.random() * 100000) + 8300000;
-  const bodyObj = {
-    jsonrpc: '2.0',
-    method: 'LMT_handle_jobs',
-    id,
-    params: {
-      jobs: [{ kind: 'default', sentences: [{ text: payload, id: 1, prefix: '' }], raw_en_context_before: [], raw_en_context_after: [], preferred_num_beams: 4 }],
-      lang: { source_lang_user_selected: sourceLang, target_lang: targetLang },
-      priority: 1,
-      commonJobParams: { mode: 'translate' },
-      timestamp: freeTimestamp(iCount),
-    },
-  };
-  let body = JSON.stringify(bodyObj);
-  body = ((id + 5) % 29 === 0 || (id + 3) % 13 === 0)
-    ? body.replace('"method":"', '"method" : "')
-    : body.replace('"method":"', '"method": "');
+  key(text, source, target) { return `${source}|${target}|${text}`; }
 
-  const response = await request('https://www2.deepl.com/jsonrpc', {
-    method: 'post',
-    body,
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'DeepLBrowserExtension/1.3.0 Mozilla/5.0',
-      'Accept': '*/*',
-    },
-  });
-  if (!response.ok) return null;
-
-  const json = await response.json();
-  const translations = json.result && json.result.translations;
-  if (!translations || !translations.length) return null;
-  const out = translations
-    .map(t => (t.beams && t.beams[0] && t.beams[0].sentences ? t.beams[0].sentences.map(s => s.text).join('') : ''))
-    .join(' ')
-    .trim();
-  if (!out) return null;
-  return { text: restoreTokens(out, kept), src: (json.result.source_lang || '').toLowerCase() };
-}
-
-async function google(text, target, source, { matcher, useGlossary }) {
-  let payload = text;
-  let kept = [];
-  if (useGlossary && matcher) {
-    const r = protectTokens(text, matcher);
-    payload = r.text;
-    kept = r.kept;
+  peek(text, source, target) {
+    if (this.cache.max !== this.cfg.cacheSize) this.cache.max = this.cfg.cacheSize;
+    const e = this.cache.get(this.key(text, source, target));
+    if (e === undefined) this.stats.cacheMisses++; else this.stats.cacheHits++;
+    return e;
   }
 
-  const url = 'https://translate.google.com/translate_a/single'
-    + '?client=at&dt=t&dt=ld&dt=qca&dt=rm&dt=bd&dj=1&hl=' + target + '&ie=UTF-8'
-    + '&oe=UTF-8&inputm=2&otf=2&iid=1dd3b944-fa62-4b55-b330-74909a99969e';
+  localSame(plain, target) {
+    const cfg = this.cfg;
+    if (!cfg.localDetect || !this.detector || plain.length < cfg.localDetectMinLength) return false;
+    try {
+      const d = this.detector.detect(plain, 1);
+      const same = !!(d && d[0] && L.baseLang(d[0][0]) === L.baseLang(target));
+      if (same) this.stats.localSkips++;
+      return same;
+    } catch (e) {
+      return false;
+    }
+  }
 
-  const params = new URLSearchParams();
-  params.append('sl', source);
-  params.append('tl', target);
-  params.append('q', payload);
+  order() {
+    const wanted = Array.isArray(this.cfg.providers) ? this.cfg.providers : ['deepl', 'google'];
+    const out = wanted.filter((n, i) => this.providers[n] && wanted.indexOf(n) === i);
+    return out.length ? out : ['deepl', 'google'];
+  }
 
-  const response = await request(url, {
-    method: 'post',
-    body: params,
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
-      'User-Agent': 'AndroidTranslate/5.3.0.RC02.130475354-53000263 5.1 phone TRANSLATE_OPM5_TEST_1',
-    },
-  });
-  const body = await response.text();
-  try {
-    const jsonBody = JSON.parse(body);
-    const trans = jsonBody.sentences.map(s => s.trans || '').join('');
-    const src = jsonBody.src || (jsonBody.ld_result && jsonBody.ld_result.srclangs && jsonBody.ld_result.srclangs[0]);
-    return { text: restoreTokens(trans, kept), src };
-  } catch (e) {
+  translate(text, source, target, { deadline } = {}) {
+    const key = this.key(text, source, target);
+    const cached = this.cache.get(key);
+    if (cached !== undefined) { this.stats.cacheHits++; return Promise.resolve(cached); }
+
+    const running = this.inflight.get(key);
+    if (running) { this.stats.joined++; return running; }
+
+    if (this.limiter.queued >= this.cfg.maxQueue) {
+      this.stats.dropped++;
+      this.log.debug(`queue full (${this.limiter.queued}), message not translated`);
+      this.notifier.notify('queue', 'Translation queue is full (chat spam?) - some messages are left untranslated', 120000);
+      return Promise.resolve(null);
+    }
+
+    const dl = deadline || Date.now() + this.cfg.holdTimeoutMs;
+    this.stats.requests++;
+    const p = this.limiter.run(() => this.chain(text, source, target, dl))
+      .then(entry => { if (entry) this.cache.set(key, entry); return entry; })
+      .catch(e => { this.log.error('unexpected translation error', e); return null; })
+      .then(entry => { this.inflight.delete(key); return entry; });
+    this.inflight.set(key, p);
+    return p;
+  }
+
+  async chain(text, source, target, deadline) {
+    const cfg = this.cfg;
+    let tried = 0;
+    let lastError = null;
+    const skipped = [];
+
+    for (const name of this.order()) {
+      const p = this.providers[name];
+      const now = Date.now();
+      if (now >= deadline) { this.log.debug(`deadline reached before trying ${name}`); break; }
+      const why = p.check(cfg, source, target, now);
+      if (why) { skipped.push(`${name}: ${why}`); continue; }
+
+      tried++;
+      const timeout = Math.max(500, Math.min(cfg.requestTimeoutMs, deadline - now + 500));
+      const t0 = Date.now();
+      try {
+        const r = await p.translate({ text, source, target }, cfg, timeout);
+        if (!r || typeof r.text !== 'string' || !r.text.trim()) throw new TranslateError('badresponse', `${name}: empty translation`);
+        const ms = Date.now() - t0;
+        p.recordSuccess(ms);
+        this.notifier.reset(`provider:${name}`);
+        const detected = L.baseLang(r.detected || (source !== 'auto' ? source : ''));
+        const same = (!!detected && detected === L.baseLang(target)) || sameText(r.text, text);
+        if (same) this.stats.sameLanguage++; else this.stats.translated++;
+        this.log.debug(`${name} ${ms}ms [${detected || '?'}->${target}]${same ? ' (same language)' : ''}`);
+        return { text: r.text, detected, same, provider: name, ms };
+      } catch (raw) {
+        const err = wrapNetworkError(raw);
+        lastError = err;
+        const res = p.recordFailure(err, cfg);
+        this.reportFailure(name, p, err, res);
+      }
+    }
+
+    this.stats.failed++;
+    if (tried === 0 && skipped.length) this.log.debug(`no provider available (${skipped.join('; ')})`);
+    else if (lastError) this.log.debug(`all providers failed, last error: ${lastError.message}`);
+    const anyUsable = this.order().some(n => !this.providers[n].check(cfg, source, target));
+    if (!anyUsable) this.notifier.notify('allfail', 'No translation provider is available right now (see "translate status")', 300000);
     return null;
   }
-}
 
-async function translate(text, translateTo, translateFrom = 'auto', opts = {}) {
-  const detected = lngDetector.detect(text, 1);
-  if (detected[0] && detected[0][0] === translateTo) return { text, src: detected[0][0] };
-
-  if (opts.deeplKey) {
-    const viaKey = await deepl(text, translateTo, translateFrom, opts).catch(() => null);
-    if (viaKey && viaKey.text) return viaKey;
-  } else {
-    const viaFree = await deeplFree(text, translateTo, translateFrom, opts).catch(() => null);
-    if (viaFree && viaFree.text) return viaFree;
+  reportFailure(name, provider, err, res) {
+    const label = provider.label(this.cfg);
+    if (res.event === 'disabled') {
+      this.log.error(`${label} disabled: ${err.message}`, null);
+      this.notifier.notify(`provider:${name}`, `${label}: key rejected (${err.message}). Fix it with "translate ${name === 'deepl' ? 'key' : 'gkey'} <key>"`, 3600000);
+    } else if (res.event === 'cooldown') {
+      const secs = Math.round(res.ms / 1000);
+      const quota = err.kind === 'quota';
+      (quota ? this.log.error : this.log.warn).call(this.log, `${label} ${res.reason}, paused for ${secs}s`, err);
+      if (quota) this.notifier.notify(`provider:${name}`, `${label}: monthly quota exceeded, falling back to the next provider`, 3600000);
+    } else {
+      this.log.debug(`${label} rejected the request: ${err.message}`);
+    }
   }
 
-  return google(text, translateTo, translateFrom, opts);
+  async test(name, text, source, target) {
+    const p = this.providers[name];
+    if (!p) throw new TranslateError('unsupported', `unknown provider "${name}"`);
+    if (!p.configured(this.cfg)) throw new TranslateError('auth', `${name} is not configured`);
+    const t0 = Date.now();
+    try {
+      const r = await p.translate({ text, source, target }, this.cfg, Math.max(this.cfg.requestTimeoutMs, 4000));
+      return { text: r.text, detected: r.detected, ms: Date.now() - t0 };
+    } catch (e) {
+      throw wrapNetworkError(e);
+    }
+  }
+
+  async deeplUsage() {
+    try {
+      return await this.providers.deepl.usage(this.cfg, Math.max(this.cfg.requestTimeoutMs, 4000));
+    } catch (e) {
+      throw wrapNetworkError(e);
+    }
+  }
+
+  clearCache() { this.cache.clear(); }
+
+  resetProviders() {
+    for (const p of Object.values(this.providers)) p.reset();
+    this.notifier.reset();
+  }
+
+  resetStats() { this.stats = this.freshStats(); }
+
+  status() {
+    const cfg = this.cfg;
+    const now = Date.now();
+    const total = this.stats.cacheHits + this.stats.cacheMisses;
+    return {
+      providers: this.order().map(name => {
+        const p = this.providers[name];
+        return {
+          name, label: p.label(cfg), state: p.state(cfg, now),
+          ok: p.stats.ok, fail: p.stats.fail, avgMs: p.stats.avgMs, lastError: p.lastError,
+        };
+      }),
+      cache: { size: this.cache.size, max: cfg.cacheSize, hitRate: total ? Math.round(100 * this.stats.cacheHits / total) : 0 },
+      limiter: { active: this.limiter.active, queued: this.limiter.queued },
+      inflight: this.inflight.size,
+      stats: Object.assign({}, this.stats),
+      detector: !!this.detector,
+    };
+  }
 }
 
-module.exports.translate = translate;
-
-const normalizeNa = (str) => {
-  return normalize(str)
-    .replace(/[^\x00-\x7F]/g, '')
-    .replace(/\s+$/, '');
-};
-module.exports.normalizeNa = normalizeNa;
+module.exports = { Translator, LRU, Limiter };

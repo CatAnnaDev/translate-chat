@@ -1,39 +1,18 @@
 'use strict';
 
-const DefaultSettings = {
-  enabled: true,
-  sourceLang: 'auto',
-  targetLang: 'en',
-  sendMode: false,
-  sendLang: 'en',
-  deeplKey: '',
-  useGlossary: true,
-  showTag: true
-};
+const { DEFAULTS } = require('./defaults');
+const config = require('./config');
+
 
 module.exports = function MigrateSettings(from_ver, to_ver, settings) {
-  if (from_ver === undefined) {
-    return Object.assign(Object.assign({}, DefaultSettings), settings);
-  } else if (from_ver === null) {
-    return DefaultSettings;
-  } else {
-    if (from_ver + 1 < to_ver) {
-      settings = MigrateSettings(from_ver, from_ver + 1, settings);
-      return MigrateSettings(from_ver + 1, to_ver, settings);
-    }
-
-    switch (to_ver) {
-      case 2:
-        settings.sendMode = false;
-        settings.sendLang = 'en';
-        break;
-      case 3:
-        settings.deeplKey = '';
-        settings.useGlossary = true;
-        settings.showTag = true;
-        break;
-    }
-
-    return settings;
-  }
+  if (from_ver === null) return clone(DEFAULTS);
+  const merged = Object.assign(clone(DEFAULTS), settings || {});
+  config.sanitize(merged);
+  return merged;
 };
+
+function clone(o) {
+  const out = {};
+  for (const k of Object.keys(o)) out[k] = Array.isArray(o[k]) ? o[k].slice() : o[k];
+  return out;
+}
