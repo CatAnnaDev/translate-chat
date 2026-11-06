@@ -9,9 +9,9 @@ The translation is added **on the same chat line** as the original message.
 
 ## How it works
 
-- **DeepL API** (Free or Pro, needs an API key) is the primary translator, **Google Translate** is the automatic fallback.
-  Without a DeepL key the mod simply uses Google.
-- A DeepL **API Free** key is free (500 000 characters / month): create an account at deepl.com, copy the key (it ends with `:fx`) and run `translate key <your-key>` in game.
+- **DeepL API Free** is the default translator (Pro keys work too), **Google Translate** is the automatic fallback.
+  Without a DeepL key the mod simply uses Google until you add one.
+- A DeepL **API Free** key costs nothing (500 000 characters / month): create a free account at deepl.com, copy the key (it ends with `:fx`) and run `translate key <your-key>` in game. The key is checked immediately and the Free endpoint is selected automatically.
 - Messages are held for a moment, translated, then re-emitted as a single packet: `original | [RU] translation`.
   Arrival order is always preserved and no message is ever held longer than `holdTimeoutMs` (3 s by default). If every provider fails, the original message is delivered unchanged: **a message is never lost**.
 - Smart savings: repeated messages are cached (LRU), identical in-flight requests are merged, text already in your language is skipped (local detector + provider detection), glossary-only / link-only / very short messages never hit the network.
@@ -41,6 +41,8 @@ Type in chat with the proxy prefix, e.g. `/8 translate status`.
 | `translate usage` | DeepL character usage |
 | `translate test [deepl\|google] <text>` | Translate a text with a given provider (diagnostics) |
 | `translate glossary` | Reload `glossary.json` |
+| `translate skip [lang...\|none]` / `unskip <lang...>` | Languages you understand, left untouched (default `en`, `fr`) |
+| `translate why [n]` | Outcome counters and the last decisions (translated, skipped language, timeout...) |
 | `translate ignore [channel]` / `unignore <channel>` | Channels that are never translated |
 | `translate cache [clear]` | Cache info / clear |
 | `translate reset` | Re-enable providers and reset counters |
@@ -64,15 +66,29 @@ Language codes: `en`, `fr`, `es`, `de`, `ru`, `pt`, `pt-BR`, `zh-CN`, ... ([list
 | `translateOwn` | `false` | Translate your own messages |
 | `echoOriginal` | `true` | Print the original text when send mode translates |
 | `ignoreChannels` | `[]` | Channel numbers to skip |
+| `skipLangs` | `["en","fr"]` | Messages detected in these languages (or in the target language) are left untouched; never applied to your outgoing messages |
+| `lateTranslation` | `true` | A translation that arrives after `holdTimeoutMs` is shown as an extra line instead of being lost |
+| `hedgeMs` | `1200` | Start the next provider (or a second request) in parallel when the first one is slow, `0` = only on failure |
 | `minLetters`, `maxLength` | `2`, `500` | Message size limits |
-| `localDetect`, `localDetectMinLength` | `true`, `10` | Local "already in my language" check |
+| `localDetect`, `localDetectMinLength` | `true`, `15` | Local "already in my language" check (strict: only when the detector is clearly confident) |
 | `asciiOnly` | `auto` | Transliterate to ASCII (automatic on the NA client) |
-| `holdTimeoutMs`, `requestTimeoutMs` | `3000`, `2000` | Latency bounds |
+| `holdTimeoutMs`, `requestTimeoutMs` | `4000`, `2500` | Latency bounds |
 | `maxConcurrent`, `maxQueue`, `cacheSize` | `4`, `100`, `2000` | Performance |
 | `notify` | `true` | In-game warnings about provider problems |
 | `logLevel`, `logFile` | `info`, `true` | Logging |
 
 Invalid values in `config.json` are repaired automatically at startup (and logged).
+
+## Updates
+
+The proxy updates the mod from this repository using `manifest.json` (SHA-256 of every file). The "newer version" notice appears when the files on GitHub and the manifest do not match what is installed, so before every push:
+
+```
+npm run manifest   # regenerate manifest.json
+npm run check      # verify manifest, versions, line endings, no comments, run the tests
+```
+
+`.gitattributes` forces LF line endings so hashes are identical on Windows. Always push the whole folder (including `manifest.json` and `module.json`) in the same commit.
 
 ## Tests
 
@@ -81,6 +97,19 @@ Invalid values in `config.json` are repaired automatically at startup (and logge
 ## Changelog
 
 ```
+3.2
+- `skipLangs`: languages you understand are left untouched (default en, fr), `translate skip` / `unskip`
+- far fewer untranslated messages: a provider is only paused after 3 consecutive failures (short pause, max 20 s),
+  one automatic retry on network errors/timeouts, a second request on a fresh connection when the only provider hangs,
+  the least penalised provider is still probed when all are paused, idle connections closed after 10 s
+- translations arriving after the hold timeout are shown as an extra line (`lateTranslation`)
+- stricter local language detection, longer default timeouts (hold 4 s, request 2.5 s)
+- `translate why`: outcome counters and the last decisions
+
+3.1
+- manifest generator and checker (`npm run manifest` / `npm run check`), version read from module.json, LF enforced
+- no comments in the source code
+
 3.0
 - translation on the same line as the message (packet held, then re-emitted), arrival order preserved
 - official DeepL API (Free/Pro, key required) + Google fallback; optional Google Cloud Translation key

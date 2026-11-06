@@ -1,0 +1,5 @@
+2026-11-06T07:22:01.825Z [INFO] created C:\Program Files (x86)\TeraToolbox Private (Asura Edition)\mods\translate-chat\glossary.json
+2026-11-06T07:22:01.830Z [INFO] v3.2 ready: enabled, target=en, skip=en,fr, providers=deepl>google, glossary=74 terms
+2026-11-06T07:22:01.830Z [INFO] no DeepL key set: Google is used (get a free key at deepl.com, then "translate key <key>")
+2026-11-06T09:48:01.609Z [INFO] v3.2 ready: enabled, target=en, skip=en,fr, providers=deepl>google, glossary=74 terms
+2026-11-06T09:48:01.610Z [INFO] no DeepL key set: Google is used (get a free key at deepl.com, then "translate key <key>")

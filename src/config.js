@@ -47,6 +47,16 @@ function validate(key, value) {
       }
       return ok(out);
     }
+    case 'langlist': {
+      if (!Array.isArray(value)) return fail('expected a list of language codes');
+      const out = [];
+      for (const v of value) {
+        const l = L.normalizeLang(v);
+        if (!l) return fail(`"${v}" is not a valid language code`);
+        if (!out.includes(l)) out.push(l);
+      }
+      return ok(out);
+    }
     case 'intlist': {
       if (!Array.isArray(value)) return fail('expected a list of numbers');
       const out = [];
@@ -89,6 +99,8 @@ function parseValue(key, args) {
       return validate(key, raw.toLowerCase() === 'none' ? '' : raw);
     case 'list':
       return validate(key, raw.split(/[\s,]+/).filter(Boolean));
+    case 'langlist':
+      return validate(key, raw.toLowerCase() === 'none' || raw === '' ? [] : raw.split(/[\s,]+/).filter(Boolean));
     case 'intlist':
       return validate(key, raw.toLowerCase() === 'none' || raw === '' ? [] : raw.split(/[\s,]+/).filter(Boolean).map(Number));
     default:

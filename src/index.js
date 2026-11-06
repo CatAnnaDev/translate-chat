@@ -15,7 +15,8 @@ const registerCommands = require('./commands');
 
 const INCOMING = ['S_CHAT', 'S_WHISPER', 'S_PRIVATE_CHAT'];
 const OUTGOING = ['C_CHAT', 'C_WHISPER'];
-const VERSION = '3.0';
+const VERSION = require('../module.json').version;
+const JOURNAL_SIZE = 40;
 
 module.exports = class TranslateChat {
   constructor(mod) {
@@ -23,6 +24,8 @@ module.exports = class TranslateChat {
     this.rootDir = path.join(__dirname, '..');
     this.version = VERSION;
     this.saveTimer = null;
+    this.reasons = {};
+    this.journal = [];
 
     const self = this;
     this.cfg = new Proxy({}, {
@@ -71,7 +74,7 @@ module.exports = class TranslateChat {
       }
     });
 
-    this.log.info(`v${VERSION} ready: ${this.cfg.enabled ? 'enabled' : 'disabled'}, target=${this.cfg.targetLang}, providers=${this.cfg.providers.join('>')}, glossary=${this.glossary.size} terms`);
+    this.log.info(`v${VERSION} ready: ${this.cfg.enabled ? 'enabled' : 'disabled'}, target=${this.cfg.targetLang}, skip=${this.cfg.skipLangs.join(',') || 'none'}, providers=${this.cfg.providers.join('>')}, glossary=${this.glossary.size} terms`);
     if (!this.cfg.deeplKey) this.log.info('no DeepL key set: Google is used (get a free key at deepl.com, then "translate key <key>")');
 
     this.destructor = () => {
@@ -83,6 +86,14 @@ module.exports = class TranslateChat {
 
   say(text) {
     try { this.mod.command.message(text); } catch (e) { this.log.debug('command.message failed', e); }
+  }
+
+  note(reason, html, detail) {
+    this.reasons[reason] = (this.reasons[reason] || 0) + 1;
+    const text = String(html || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    this.journal.push({ t: Date.now(), reason, detail: detail || '', text });
+    if (this.journal.length > JOURNAL_SIZE) this.journal.shift();
+    this.log.debug(`${reason}${detail ? ` [${detail}]` : ''}: ${text}`);
   }
 
   scheduleSave() {
@@ -109,7 +120,7 @@ module.exports = class TranslateChat {
   isOwn(event) {
     try {
       if (event.gameId !== undefined && this.mod.game.me.is(event.gameId)) return true;
-    } catch (e) { /* not logged in yet */ }
+    } catch (e) {}
     const name = event.name || event.author || event.authorName || event.player;
     const me = this.mod.game.me;
     return !!(name && me && me.name && name === me.name);
@@ -149,54 +160,96 @@ module.exports = class TranslateChat {
 
     const separate = cfg.displayMode === 'separate';
     const seq = this.inbound;
-    const pass = () => (separate ? undefined : this.passthrough(seq, packet, version, event));
+    const pass = (reason, detail) => {
+      this.note(reason, event.message, detail);
+      return separate ? undefined : this.passthrough(seq, packet, version, event);
+    };
 
-    if (!cfg.translateOwn && this.isOwn(event)) return pass();
-    if (event.channel !== undefined && cfg.ignoreChannels.includes(event.channel)) return pass();
+    if (!cfg.translateOwn && this.isOwn(event)) return pass('own message');
+    if (event.channel !== undefined && cfg.ignoreChannels.includes(event.channel)) return pass('ignored channel');
 
     const source = cfg.sourceLang;
     const target = cfg.targetLang;
-    if (source !== 'auto' && L.baseLang(source) === L.baseLang(target)) return pass();
+    if (source !== 'auto' && L.baseLang(source) === L.baseLang(target)) return pass('source = target');
 
     const parsed = msg.parse(event.message, cfg.useGlossary ? this.glossary : null);
-    if (parsed.letters < cfg.minLetters || parsed.text.length > cfg.maxLength) return pass();
+    if (parsed.letters < cfg.minLetters) return pass('nothing to translate');
+    if (parsed.text.length > cfg.maxLength) return pass('too long');
 
     const tr = this.translator;
+    const useSkip = source === 'auto';
     const cached = tr.peek(parsed.text, source, target);
-    if (cached === undefined && tr.localSame(parsed.plain, target)) return pass();
+    if (cached === undefined) {
+      const lang = tr.localSkip(parsed.plain, target, useSkip);
+      if (lang) return pass('skipped language (local)', lang);
+    }
 
     const transform = this.transform();
 
+    const decide = (e, timedOut, hit) => {
+      if (!e) {
+        this.note(timedOut ? 'timeout' : 'no provider answer', event.message);
+        return null;
+      }
+      if (e.unchanged) {
+        this.note('unchanged by provider', event.message, e.detected);
+        return null;
+      }
+      if (tr.isSame(e, target, useSkip)) {
+        this.note('skipped language (provider)', event.message, e.detected);
+        return null;
+      }
+      this.note(hit ? 'translated (cache)' : 'translated', event.message, `${e.detected || '?'} via ${e.provider}`);
+      return e;
+    };
+
+    const showSeparate = e => {
+      this.send(packet, version, Object.assign({}, event, { message: msg.renderSeparate(parsed, e, cfg, transform) }));
+    };
+
     if (separate) {
-      const show = e => {
-        if (e && !e.same) this.send(packet, version, Object.assign({}, event, { message: msg.renderSeparate(parsed, e, cfg, transform) }));
+      const show = (e, hit) => {
+        const d = decide(e, false, hit);
+        if (d) showSeparate(d);
       };
-      if (cached !== undefined) show(cached);
-      else tr.translate(parsed.text, source, target, { deadline: Date.now() + cfg.holdTimeoutMs }).then(show).catch(e => this.log.error('separate display failed', e));
+      if (cached !== undefined) show(cached, true);
+      else tr.translate(parsed.text, source, target, { deadline: Date.now() + cfg.holdTimeoutMs }).then(e => show(e, false)).catch(e => this.log.error('separate display failed', e));
       return undefined;
     }
 
-    const render = e => (e && !e.same ? msg.renderInbound(event.message, parsed, e, cfg, transform) : null);
-    const deliver = e => {
-      const m = render(e);
-      this.send(packet, version, m === null ? event : Object.assign({}, event, { message: m }));
+    const deliver = (e, timedOut, hit) => {
+      const d = decide(e, timedOut, hit);
+      this.send(packet, version, d ? Object.assign({}, event, { message: msg.renderInbound(event.message, parsed, d, cfg, transform) }) : event);
     };
 
     if (cached !== undefined) {
       if (seq.pending === 0) {
-        const m = render(cached);
-        if (m === null) return undefined;
-        event.message = m;
+        const d = decide(cached, false, true);
+        if (!d) return undefined;
+        event.message = msg.renderInbound(event.message, parsed, d, cfg, transform);
         return true;
       }
-      seq.add(cached, 0, deliver);
+      seq.add(cached, 0, e => deliver(e, false, true));
       return false;
     }
 
     const promise = tr.translate(parsed.text, source, target, { deadline: Date.now() + cfg.holdTimeoutMs });
+    const late = { timedOut: false, entry: undefined };
+    const showLate = e => {
+      if (!cfg.lateTranslation || !e || e.unchanged || tr.isSame(e, target, useSkip)) return;
+      this.note('translated (late)', event.message, `${e.detected || '?'} via ${e.provider}`);
+      showSeparate(e);
+    };
+    promise.then(e => {
+      late.entry = e;
+      if (late.timedOut) showLate(e);
+    }).catch(() => {});
     seq.add(promise, cfg.holdTimeoutMs, (e, timedOut) => {
-      if (timedOut) this.log.debug(`translation timed out after ${cfg.holdTimeoutMs}ms, original message delivered`);
-      deliver(e);
+      if (timedOut) {
+        late.timedOut = true;
+        if (late.entry !== undefined) showLate(late.entry);
+      }
+      deliver(e, timedOut, false);
     });
     return false;
   }
@@ -206,35 +259,44 @@ module.exports = class TranslateChat {
     if (!cfg.enabled || !cfg.sendMode || typeof event.message !== 'string' || !event.message) return undefined;
 
     const seq = this.outbound;
-    const pass = () => this.passthrough(seq, packet, version, event);
+    const pass = reason => {
+      this.note(`out: ${reason}`, event.message);
+      return this.passthrough(seq, packet, version, event);
+    };
     const target = cfg.sendLang;
 
     const parsed = msg.parse(event.message, cfg.useGlossary ? this.glossary : null);
-    if (parsed.letters < cfg.minLetters || parsed.text.length > cfg.maxLength) return pass();
+    if (parsed.letters < cfg.minLetters) return pass('nothing to translate');
+    if (parsed.text.length > cfg.maxLength) return pass('too long');
 
     const tr = this.translator;
     const cached = tr.peek(parsed.text, 'auto', target);
-    if (cached === undefined && tr.localSame(parsed.plain, target)) return pass();
+    if (cached === undefined && tr.localSkip(parsed.plain, target, false)) return pass('already in target language');
 
-    const deliver = e => {
-      if (e && !e.same) {
+    const deliver = (e, timedOut) => {
+      if (e && !e.unchanged && !tr.isSame(e, target, false)) {
+        this.note('out: translated', event.message, `${e.detected || '?'} via ${e.provider}`);
         this.send(packet, version, Object.assign({}, event, { message: msg.renderOutbound(parsed, e) }));
         if (cfg.echoOriginal) this.say(`Original message: ${parsed.plain}`);
       } else {
+        this.note(e ? 'out: already in target language' : (timedOut ? 'out: timeout' : 'out: no provider answer'), event.message);
         this.send(packet, version, event);
       }
     };
 
     if (cached !== undefined) {
-      if (seq.pending === 0 && (!cached || cached.same)) return undefined;
-      seq.add(cached, 0, deliver);
+      if (seq.pending === 0 && (cached.unchanged || tr.isSame(cached, target, false))) {
+        this.note('out: already in target language', event.message);
+        return undefined;
+      }
+      seq.add(cached, 0, e => deliver(e, false));
       return false;
     }
 
     const promise = tr.translate(parsed.text, 'auto', target, { deadline: Date.now() + cfg.holdTimeoutMs });
     seq.add(promise, cfg.holdTimeoutMs, (e, timedOut) => {
       if (timedOut) this.log.warn(`outgoing translation timed out after ${cfg.holdTimeoutMs}ms, message sent untranslated`);
-      deliver(e);
+      deliver(e, timedOut);
     });
     return false;
   }

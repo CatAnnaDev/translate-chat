@@ -3,7 +3,7 @@
 const https = require('https');
 const { URL } = require('url');
 
-const agent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 8, maxFreeSockets: 4 });
+const agent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 8, maxFreeSockets: 4, scheduling: 'lifo', timeout: 10000 });
 
 function request(url, { method = 'GET', headers = {}, body = null, timeout = 2000, maxBytes = 262144 } = {}) {
   return new Promise((resolve, reject) => {

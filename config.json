@@ -1,5 +1,5 @@
 {
-    "version": 4,
+    "version": 5,
     "data": {
         "enabled": true,
         "sourceLang": "auto",
@@ -20,13 +20,19 @@
         "translateOwn": false,
         "echoOriginal": true,
         "ignoreChannels": [],
+        "skipLangs": [
+            "en",
+            "fr"
+        ],
+        "lateTranslation": true,
+        "hedgeMs": 1200,
         "minLetters": 2,
         "maxLength": 500,
         "localDetect": true,
-        "localDetectMinLength": 10,
+        "localDetectMinLength": 15,
         "asciiOnly": "auto",
-        "holdTimeoutMs": 3000,
-        "requestTimeoutMs": 2000,
+        "holdTimeoutMs": 4000,
+        "requestTimeoutMs": 2500,
         "maxConcurrent": 4,
         "maxQueue": 100,
         "cacheSize": 2000,

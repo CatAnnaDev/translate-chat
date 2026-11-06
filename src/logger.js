@@ -54,7 +54,7 @@ class Logger {
       if (level === 'error') this.mod.error(line);
       else if (level === 'warn') this.mod.warn(line);
       else this.mod.log(line);
-    } catch (e) { /* console must never break the mod */ }
+    } catch (e) {}
 
     if (this.fileEnabled() && !this.fileDisabled) {
       let text = line;
@@ -84,7 +84,7 @@ class Logger {
       try { this.fileSize = fs.statSync(this.file).size; } catch (e) { this.fileSize = 0; }
     }
     if (this.fileSize > MAX_FILE_BYTES) {
-      try { fs.renameSync(this.file, this.file + '.1'); } catch (e) { /* ignore */ }
+      try { fs.renameSync(this.file, this.file + '.1'); } catch (e) {}
       this.fileSize = 0;
     }
   }
@@ -102,13 +102,13 @@ class Logger {
       this.fileFailures++;
       if (this.fileFailures >= 3) {
         this.fileDisabled = true;
-        try { this.mod.warn(`log file disabled after repeated write errors: ${e.message}`); } catch (x) { /* ignore */ }
+        try { this.mod.warn(`log file disabled after repeated write errors: ${e.message}`); } catch (x) {}
       }
     }
   }
 
   destroy() {
-    if (this.timer) { try { this.mod.clearTimeout(this.timer); } catch (e) { /* ignore */ } this.timer = null; }
+    if (this.timer) { try { this.mod.clearTimeout(this.timer); } catch (e) {} this.timer = null; }
     this.flush();
   }
 }

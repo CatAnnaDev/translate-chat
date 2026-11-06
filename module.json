@@ -1,12 +1,12 @@
 {
-  "disableAutoUpdate": true,
+  "disableAutoUpdate": false,
   "name": "translate-chat",
   "author": "CatAnnaDev",
-  "version": "3.0",
+  "version": "3.2",
   "description": "Chat translator: DeepL API (Free/Pro key) with Google fallback, translation on the same chat line, glossary, cache, circuit breaker, logs and full in-game configuration.",
   "options": {
     "niceName": "translate-chat",
-    "settingsVersion": 4,
+    "settingsVersion": 5,
     "settingsFile": "config.json",
     "settingsMigrator": "src/setting_migration.js"
   },

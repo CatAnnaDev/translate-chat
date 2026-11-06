@@ -47,19 +47,26 @@ class Provider {
     this.disabledKey = null;
     this.lastError = '';
     this.lastErrorAt = 0;
+    this.lastAttemptAt = 0;
     this.unsupported = new Set();
   }
 
   keyId() { return ''; }
   configured() { return true; }
 
-  check(cfg, source, target, now = Date.now()) {
+  probeable(cfg, source, target, now = Date.now()) {
+    return now < this.cooldownUntil
+      && now - this.lastAttemptAt >= 1000
+      && this.check(cfg, source, target, now, true) === null;
+  }
+
+  check(cfg, source, target, now = Date.now(), ignoreCooldown = false) {
     if (!this.configured(cfg)) return 'not configured';
     if (this.disabledReason) {
       if (this.disabledKey !== this.keyId(cfg)) { this.disabledReason = ''; this.disabledKey = null; this.streak = 0; }
       else return this.disabledReason;
     }
-    if (now < this.cooldownUntil) return `cooldown ${Math.ceil((this.cooldownUntil - now) / 1000)}s (${this.cooldownReason})`;
+    if (!ignoreCooldown && now < this.cooldownUntil) return `cooldown ${Math.ceil((this.cooldownUntil - now) / 1000)}s (${this.cooldownReason})`;
     if (this.unsupported.has('T:' + target)) return `target language ${target} not supported`;
     if (source && source !== 'auto' && this.unsupported.has('S:' + source)) return `source language ${source} not supported`;
     return null;
@@ -94,8 +101,13 @@ class Provider {
     let ms;
     let reason;
     if (err.kind === 'quota') { ms = 30 * 60e3; reason = 'quota exceeded'; }
-    else if (err.kind === 'ratelimit') { this.streak++; ms = err.retryAfterMs || Math.min(10 * 60e3, 15e3 * Math.pow(2, this.streak - 1)); reason = 'rate limited'; }
-    else { this.streak++; ms = Math.min(60e3, 1000 * Math.pow(2, this.streak)); reason = err.kind; }
+    else if (err.kind === 'ratelimit') { this.streak++; ms = err.retryAfterMs || Math.min(5 * 60e3, 10e3 * Math.pow(2, this.streak - 1)); reason = 'rate limited'; }
+    else {
+      this.streak++;
+      if (this.streak < 3) return { event: null };
+      ms = Math.min(20e3, 2e3 * Math.pow(2, this.streak - 3));
+      reason = err.kind;
+    }
     this.cooldown(ms, reason);
     return { event: 'cooldown', ms, reason };
   }
@@ -140,7 +152,7 @@ class DeepL extends Provider {
   classify(res, req) {
     const s = res.status;
     let msg = `HTTP ${s}`;
-    try { const j = JSON.parse(res.body); if (j && j.message) msg += `: ${j.message}`; } catch (e) { /* keep generic message */ }
+    try { const j = JSON.parse(res.body); if (j && j.message) msg += `: ${j.message}`; } catch (e) {}
     const extra = { status: s };
     if (s === 400) {
       if (/target_lang/i.test(msg)) throw new TranslateError('unsupported', msg, Object.assign(extra, { langKey: 'T:' + (req && req.target) }));
@@ -259,7 +271,7 @@ class Google extends Provider {
 
     if (res.status !== 200) {
       let msg = `HTTP ${res.status}`;
-      try { const j = JSON.parse(res.body); if (j && j.error && j.error.message) msg += `: ${j.error.message}`; } catch (e) { /* generic */ }
+      try { const j = JSON.parse(res.body); if (j && j.error && j.error.message) msg += `: ${j.error.message}`; } catch (e) {}
       const extra = { status: res.status };
       if (res.status === 429) throw new TranslateError('ratelimit', msg, Object.assign(extra, { retryAfterMs: retryAfterMs(res.headers) }));
       if (res.status === 401 || res.status === 403 || (res.status === 400 && /API key/i.test(msg))) {

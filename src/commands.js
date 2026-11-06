@@ -35,7 +35,8 @@ module.exports = function registerCommands(app) {
     const s = translator.status();
     const stats = s.stats;
     const head = `translate v${app.version} [${cfg.enabled ? 'ON' : 'OFF'}] ${cfg.sourceLang} -> ${cfg.targetLang}`
-      + ` | send: ${cfg.sendMode ? cfg.sendLang : 'off'} | display: ${cfg.displayMode} | tag: ${onOff(cfg.showTag)} | glossary: ${cfg.useGlossary ? glossary.size + ' terms' : 'off'}`;
+      + ` | send: ${cfg.sendMode ? cfg.sendLang : 'off'} | display: ${cfg.displayMode} | tag: ${onOff(cfg.showTag)} | glossary: ${cfg.useGlossary ? glossary.size + ' terms' : 'off'}`
+      + ` | skip: ${config.describe('skipLangs', cfg.skipLangs)}`;
     const out = [head];
     for (const p of s.providers) {
       const perf = p.ok || p.fail ? ` - ${p.ok} ok / ${p.fail} failed${p.avgMs ? `, ~${p.avgMs} ms` : ''}` : '';
@@ -44,7 +45,7 @@ module.exports = function registerCommands(app) {
     }
     out.push(`Cache ${s.cache.size}/${s.cache.max} (${s.cache.hitRate}% hits) | in flight ${s.inflight}, queued ${s.limiter.queued}`
       + ` | held in: ${app.inbound.pending}, out: ${app.outbound.pending}`);
-    out.push(`Translated ${stats.translated}, same language ${stats.sameLanguage}, local skips ${stats.localSkips}, failed ${stats.failed}, dropped ${stats.dropped}`
+    out.push(`Translated ${stats.translated}, same language ${stats.sameLanguage}, local skips ${stats.localSkips}, failed ${stats.failed}, dropped ${stats.dropped}, retries ${stats.retries}, probes ${stats.probes}`
       + `${s.detector ? '' : ' | local detector unavailable'}`);
     lines(out);
   }
@@ -66,6 +67,8 @@ module.exports = function registerCommands(app) {
       'translate - toggle on/off | on | off | status | config | help',
       'translate source <lang|auto> | target <lang> | send [lang|on|off] | mode <inline|replace|separate>',
       'translate tag [on|off] | color <#rrggbb|off> | providers <deepl google> | ignore [channel] | unignore <channel>',
+      'translate skip [lang...|none] | unskip <lang...>   (languages you understand, left untouched)',
+      'translate why [n]   (why the last messages were or were not translated)',
       'translate key <deepl-key|none> | gkey <google-key|none> | usage | test [deepl|google] <text>',
       'translate glossary (reload) | cache [clear] | reset | errors [n] | log <error|warn|info|debug|file on|off>',
       'translate set <name> <value> | get <name>   (see "translate config")',
@@ -209,6 +212,33 @@ module.exports = function registerCommands(app) {
       if (LEVELS[a] === undefined) return say('Usage: translate log <error|warn|info|debug> | translate log file <on|off>');
       cfg.logLevel = a;
       say(`Log level set to ${a}.`);
+    },
+
+    skip(...langs) {
+      if (!langs.length) return say(`Languages left untouched: ${config.describe('skipLangs', cfg.skipLangs)}`);
+      if (langs.length === 1 && String(langs[0]).toLowerCase() === 'none') {
+        cfg.skipLangs = [];
+        return say('No language is skipped anymore (only the target language is left untouched).');
+      }
+      const r = config.validate('skipLangs', cfg.skipLangs.concat(langs));
+      if (!r.ok) return say(`Error: ${r.error}`);
+      cfg.skipLangs = r.value;
+      say(`Languages left untouched: ${config.describe('skipLangs', r.value)}`);
+    },
+
+    unskip(...langs) {
+      if (!langs.length) return say('Usage: translate unskip <lang> [lang...]');
+      const drop = new Set(langs.map(l => L.normalizeLang(l)).filter(Boolean));
+      cfg.skipLangs = cfg.skipLangs.filter(l => !drop.has(l));
+      say(`Languages left untouched: ${config.describe('skipLangs', cfg.skipLangs)}`);
+    },
+
+    why(n) {
+      const count = Math.max(1, Math.min(30, parseInt(n, 10) || 10));
+      const top = Object.entries(app.reasons).sort((a, b) => b[1] - a[1]).slice(0, 8);
+      if (!top.length) return say('No message has been processed yet.');
+      say(`Outcomes: ${top.map(([r, c]) => `${r} ${c}`).join(' | ')}`);
+      lines(app.journal.slice(-count).map(j => `${fmtAge(Date.now() - j.t)} ${j.reason}${j.detail ? ` [${j.detail}]` : ''}: ${j.text}`));
     },
 
     ignore(ch) {

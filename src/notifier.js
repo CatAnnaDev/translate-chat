@@ -1,6 +1,5 @@
 'use strict';
 
-
 class Notifier {
   constructor({ mod, cfg, log }) {
     this.mod = mod;
