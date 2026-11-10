@@ -42,6 +42,7 @@ Type in chat with the proxy prefix, e.g. `/8 translate status`.
 | `translate test [deepl\|google] <text>` | Translate a text with a given provider (diagnostics) |
 | `translate glossary` | Reload `glossary.json` |
 | `translate skip [lang...\|none]` / `unskip <lang...>` | Languages you understand, left untouched (default `en`, `fr`) |
+| `translate lfg [on\|off]` | Translate party finder listings and party links |
 | `translate why [n]` | Outcome counters and the last decisions (translated, skipped language, timeout...) |
 | `translate ignore [channel]` / `unignore <channel>` | Channels that are never translated |
 | `translate cache [clear]` | Cache info / clear |
@@ -66,6 +67,7 @@ Language codes: `en`, `fr`, `es`, `de`, `ru`, `pt`, `pt-BR`, `zh-CN`, ... ([list
 | `translateOwn` | `false` | Translate your own messages |
 | `echoOriginal` | `true` | Print the original text when send mode translates |
 | `ignoreChannels` | `[]` | Channel numbers to skip |
+| `partyMatch` | `true` | Translate party finder (LFG) listings and party links (plain text, same separator/tag settings) |
 | `skipLangs` | `["en","fr"]` | Messages detected in these languages (or in the target language) are left untouched; never applied to your outgoing messages |
 | `lateTranslation` | `true` | A translation that arrives after `holdTimeoutMs` is shown as an extra line instead of being lost |
 | `hedgeMs` | `1200` | Start the next provider (or a second request) in parallel when the first one is slow, `0` = only on failure |
@@ -97,6 +99,15 @@ npm run check      # verify manifest, versions, line endings, no comments, run t
 ## Changelog
 
 ```
+3.4
+- party finder: listings (`S_SHOW_PARTY_MATCH_INFO`) and party links (`S_PARTY_MATCH_LINK`) are translated as plain text
+  (`original | [RU] translation`), your own listing is left alone; `translate lfg [on|off]` / setting `partyMatch`
+
+3.3
+- compatible with ColoredChat and other colour mods: text wrapped in a coloured `ChatLinkAction` (item id 0) is translated,
+  and your outgoing translated messages keep the exact same colour frame; plain `<FONT color>` messages keep their colour too
+  (real item/quest links are still protected)
+
 3.2
 - `skipLangs`: languages you understand are left untouched (default en, fr), `translate skip` / `unskip`
 - far fewer untranslated messages: a provider is only paused after 3 consecutive failures (short pause, max 20 s),

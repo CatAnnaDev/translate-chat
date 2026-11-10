@@ -69,6 +69,7 @@ module.exports = function registerCommands(app) {
       'translate tag [on|off] | color <#rrggbb|off> | providers <deepl google> | ignore [channel] | unignore <channel>',
       'translate skip [lang...|none] | unskip <lang...>   (languages you understand, left untouched)',
       'translate why [n]   (why the last messages were or were not translated)',
+      'translate lfg [on|off]   (party finder listings and party links)',
       'translate key <deepl-key|none> | gkey <google-key|none> | usage | test [deepl|google] <text>',
       'translate glossary (reload) | cache [clear] | reset | errors [n] | log <error|warn|info|debug|file on|off>',
       'translate set <name> <value> | get <name>   (see "translate config")',
@@ -212,6 +213,14 @@ module.exports = function registerCommands(app) {
       if (LEVELS[a] === undefined) return say('Usage: translate log <error|warn|info|debug> | translate log file <on|off>');
       cfg.logLevel = a;
       say(`Log level set to ${a}.`);
+    },
+
+    lfg(v) {
+      if (v === undefined) {
+        cfg.partyMatch = !cfg.partyMatch;
+        return say(`Party finder translation ${cfg.partyMatch ? 'enabled' : 'disabled'}.`);
+      }
+      apply('partyMatch', config.parseValue('partyMatch', [v]), 'Party finder translation');
     },
 
     skip(...langs) {

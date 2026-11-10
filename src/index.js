@@ -17,6 +17,7 @@ const INCOMING = ['S_CHAT', 'S_WHISPER', 'S_PRIVATE_CHAT'];
 const OUTGOING = ['C_CHAT', 'C_WHISPER'];
 const VERSION = require('../module.json').version;
 const JOURNAL_SIZE = 40;
+const MAX_LISTING = 250;
 
 module.exports = class TranslateChat {
   constructor(mod) {
@@ -62,6 +63,7 @@ module.exports = class TranslateChat {
     const timers = { setTimer: (fn, ms) => mod.setTimeout(fn, ms), clearTimer: t => mod.clearTimeout(t), onError };
     this.inbound = new OrderedRelease(timers);
     this.outbound = new OrderedRelease(timers);
+    this.lists = new OrderedRelease(timers);
 
     registerCommands(this);
     this.setupHooks();
@@ -80,6 +82,7 @@ module.exports = class TranslateChat {
     this.destructor = () => {
       this.inbound.clear();
       this.outbound.clear();
+      this.lists.clear();
       this.log.destroy();
     };
   }
@@ -136,6 +139,111 @@ module.exports = class TranslateChat {
     const opts = { order: 100, filter: { fake: false } };
     for (const packet of INCOMING) this.hookPacket(packet, opts, (event, version) => this.onIncoming(packet, version, event));
     for (const packet of OUTGOING) this.hookPacket(packet, opts, (event, version) => this.onOutgoing(packet, version, event));
+    this.hookPacket('S_SHOW_PARTY_MATCH_INFO', opts, (event, version) => this.onPartyList('S_SHOW_PARTY_MATCH_INFO', version, event));
+    this.hookPacket('S_PARTY_MATCH_LINK', opts, (event, version) => this.onPartyLink('S_PARTY_MATCH_LINK', version, event));
+  }
+
+  isOwnLeader(listing) {
+    const name = listing.leaderName || listing.leader || listing.name;
+    const me = this.mod.game.me;
+    return !!(name && me && me.name && name === me.name);
+  }
+
+  planPlain(text) {
+    const cfg = this.cfg;
+    const source = cfg.sourceLang;
+    const target = cfg.targetLang;
+    if (source !== 'auto' && L.baseLang(source) === L.baseLang(target)) return null;
+    const parsed = msg.parsePlain(text, cfg.useGlossary ? this.glossary : null);
+    if (parsed.letters < cfg.minLetters || parsed.text.length > cfg.maxLength) return null;
+    const tr = this.translator;
+    const useSkip = source === 'auto';
+    const cached = tr.peek(parsed.text, source, target);
+    if (cached === undefined && tr.localSkip(parsed.plain, target, useSkip)) return null;
+    const promise = cached !== undefined
+      ? Promise.resolve(cached)
+      : tr.translate(parsed.text, source, target, { deadline: Date.now() + cfg.holdTimeoutMs });
+    return { parsed, cached, promise, source, target, useSkip };
+  }
+
+  composePlain(original, plan, entry) {
+    const cfg = this.cfg;
+    const tr = this.translator;
+    if (!entry) {
+      this.note('lfg: no translation', original);
+      return null;
+    }
+    if (entry.unchanged || tr.isSame(entry, plan.target, plan.useSkip)) {
+      this.note('lfg: skipped language', original, entry.detected);
+      return null;
+    }
+    const body = msg.toPlain(entry.text, plan.parsed.spans, this.transform());
+    const tag = cfg.showTag && entry.detected ? `[${entry.detected.toUpperCase()}] ` : '';
+    const out = cfg.displayMode === 'replace' ? `${tag}${body}` : `${original}${cfg.separator}${tag}${body}`;
+    this.note('lfg: translated', original, `${entry.detected || '?'} via ${entry.provider}`);
+    return out.length > MAX_LISTING ? out.slice(0, MAX_LISTING) : out;
+  }
+
+  settle(promise, ms) {
+    return new Promise(resolve => {
+      const timer = this.mod.setTimeout(() => resolve(null), ms);
+      promise.then(
+        e => { this.mod.clearTimeout(timer); resolve(e); },
+        () => { this.mod.clearTimeout(timer); resolve(null); }
+      );
+    });
+  }
+
+  onPartyList(packet, version, event) {
+    const cfg = this.cfg;
+    if (!cfg.enabled || !cfg.partyMatch || !Array.isArray(event.listings) || !event.listings.length) return undefined;
+
+    const seq = this.lists;
+    const plans = event.listings.map(l => (l && typeof l.message === 'string' && l.message && !this.isOwnLeader(l) ? this.planPlain(l.message) : null));
+    if (!plans.some(Boolean)) return this.passthrough(seq, packet, version, event);
+
+    if (seq.pending === 0 && plans.every(p => !p || p.cached !== undefined)) {
+      let changed = false;
+      event.listings.forEach((l, i) => {
+        const m = plans[i] ? this.composePlain(l.message, plans[i], plans[i].cached) : null;
+        if (m !== null) { l.message = m; changed = true; }
+      });
+      return changed ? true : undefined;
+    }
+
+    const hold = cfg.holdTimeoutMs;
+    const all = Promise.all(plans.map(p => (p ? this.settle(p.promise, hold) : null)));
+    seq.add(all, hold + 500, entries => {
+      const listings = event.listings.map((l, i) => {
+        const m = entries && plans[i] ? this.composePlain(l.message, plans[i], entries[i]) : null;
+        return m === null ? l : Object.assign({}, l, { message: m });
+      });
+      this.send(packet, version, Object.assign({}, event, { listings }));
+    });
+    return false;
+  }
+
+  onPartyLink(packet, version, event) {
+    const cfg = this.cfg;
+    if (!cfg.enabled || !cfg.partyMatch || typeof event.message !== 'string' || !event.message) return undefined;
+
+    const seq = this.lists;
+    const plan = this.isOwnLeader(event) ? null : this.planPlain(event.message);
+    if (!plan) return this.passthrough(seq, packet, version, event);
+
+    if (plan.cached !== undefined && seq.pending === 0) {
+      const m = this.composePlain(event.message, plan, plan.cached);
+      if (m === null) return undefined;
+      event.message = m;
+      return true;
+    }
+
+    const hold = cfg.holdTimeoutMs;
+    seq.add(this.settle(plan.promise, hold), hold + 500, e => {
+      const m = this.composePlain(event.message, plan, e);
+      this.send(packet, version, m === null ? event : Object.assign({}, event, { message: m }));
+    });
+    return false;
   }
 
   hookPacket(packet, opts, handler) {
